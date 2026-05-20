@@ -1,20 +1,19 @@
 # =============================================================================
-#  Docker image pre-configured for ComfyUI on RunPod
-#  - PyTorch nightly cu130 (compatible with Blackwell / NVFP4)
+#  Docker image pre-configured for ComfyUI on RunPod / Vast.ai
+#  - PyTorch 2.12 + CUDA 13.0 (Blackwell / NVFP4 compatible)
 #  - ComfyUI cloned into /opt/ComfyUI (volume only stores models/nodes/user)
-#  - Sage Attention + xformers + ffmpeg
-#  - Entrypoint reads /workspace/config.json and syncs nodes/models on boot
+#  - Sage Attention compiled per-GPU-arch at runtime (see entrypoint.sh)
 # =============================================================================
 
-# Official RunPod base with CUDA 13 + PyTorch 2.9.1.
-# Tags at https://hub.docker.com/r/runpod/pytorch/tags
-ARG BASE_IMAGE=runpod/pytorch:1.0.3-cu1300-torch291-ubuntu2404
+# Official PyTorch image: torch 2.12 + CUDA 13.0 toolkit + cuDNN9 + nvcc.
+# ~7.6 GB base vs ~14 GB for the previous runpod/pytorch base, and removes the
+# need to reinstall torch on top (saves another ~5 GB of layer overhead).
+# Tags at https://hub.docker.com/r/pytorch/pytorch/tags
+ARG BASE_IMAGE=pytorch/pytorch:2.12.0-cuda13.0-cudnn9-devel
 FROM ${BASE_IMAGE}
 
 # ----- Build args (editable at build time without rewriting Dockerfile) ------
 ARG COMFYUI_VERSION=v0.21.1
-ARG TORCH_VERSION=2.12.0
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
 ARG INSTALL_SAGE=true
 ENV COMFYUI_VERSION=${COMFYUI_VERSION} \
     COMFYUI_HOME=/opt/ComfyUI \
@@ -22,6 +21,7 @@ ENV COMFYUI_VERSION=${COMFYUI_VERSION} \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:${PATH}
@@ -34,37 +34,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /var/run/sshd \
     && rm -rf /var/lib/apt/lists/*
 
-# ----- File browser (filebrowser.org) ----------------------------------------
-# Embedded web UI for uploading/downloading models, editing configs, viewing
-# logs while the pod is live. Exposed via nginx at /files/ on port 8188.
-RUN curl -fsSL https://github.com/filebrowser/filebrowser/releases/download/v2.32.0/linux-amd64-filebrowser.tar.gz \
-        | tar -xz -C /usr/local/bin filebrowser \
-    && chmod +x /usr/local/bin/filebrowser \
-    && /usr/local/bin/filebrowser version
-
 # ----- ComfyUI in /opt -------------------------------------------------------
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git "${COMFYUI_HOME}" \
     && cd "${COMFYUI_HOME}" \
     && git checkout "${COMFYUI_VERSION}"
 
-# ----- torch -----------------------------------------------------------------
-# Pins torch ${TORCH_VERSION} from the cu130 index (Blackwell-compatible).
-# Reinstalls torchvision/torchaudio together to keep ABI aligned.
-# xformers was removed: the PyPI wheel is built for torch 2.10/py3.10 and cannot
-# load its C++/CUDA extensions on our torch 2.12/py3.12, so it was effectively
-# a stub. PyTorch SDPA (F.scaled_dot_product_attention) covers memory-efficient
-# + flash-attn-2 paths natively, and Sage Attention 2.x overrides attention
-# anyway via --use-sage-attention.
-# Sage Attention is NOT built here — see entrypoint.sh. Compiling all archs in
-# the image OOMs Docker Desktop (~22 GB at the _fused.so link). At runtime we
-# detect the GPU's compute_cap and compile only that arch (~6 GB, ~5 min) and
-# cache the wheel on the persistent volume.
+# Verify the base image actually provides the expected torch/CUDA stack.
 ENV INSTALL_SAGE=${INSTALL_SAGE}
-RUN pip uninstall -y torch torchvision torchaudio xformers || true \
-    && pip install \
-        "torch==${TORCH_VERSION}" torchvision torchaudio \
-        --index-url "${TORCH_INDEX}" \
-    && python3 -c "import torch, torchvision, torchaudio; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+RUN python3 -c "import torch, torchvision, torchaudio; print('torch', torch.__version__, 'cuda', torch.version.cuda); assert torch.version.cuda.startswith('13.'), torch.version.cuda"
 
 # ----- ComfyUI requirements + custom-node dependencies -----------------------
 RUN pip install --upgrade-strategy only-if-needed -r "${COMFYUI_HOME}/requirements.txt" \

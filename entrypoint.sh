@@ -57,7 +57,7 @@ fi
 # to Vast's portal. Print the recommended value so the user can copy/paste.
 if [[ -z "${PORTAL_CONFIG:-}" ]]; then
     log "Vast.ai users: set this env var on your template for the portal UI:"
-    log '  PORTAL_CONFIG="localhost:8188:18188:/:ComfyUI|localhost:8090:18090:/files/:File Browser"'
+    log '  PORTAL_CONFIG="localhost:8188:18188:/:ComfyUI"'
 fi
 
 # ----- Pre-flight: check disk space ------------------------------------------
@@ -339,7 +339,7 @@ python3 main.py \
 COMFY_PID=$!
 
 # Bring nginx down with us if ComfyUI dies
-trap 'kill -TERM $COMFY_PID 2>/dev/null; kill -TERM $FB_PID 2>/dev/null; nginx -s quit 2>/dev/null; exit' INT TERM
+trap 'kill -TERM $COMFY_PID 2>/dev/null; nginx -s quit 2>/dev/null; exit' INT TERM
 
 # Wait for ComfyUI to bind the internal port (5 min timeout)
 log "Waiting for ComfyUI to bind 127.0.0.1:${INTERNAL_PORT}..."
@@ -357,30 +357,6 @@ for i in $(seq 1 150); do
         warn "ComfyUI did not respond in 5 min — starting nginx anyway"
     fi
 done
-
-# ----- Start filebrowser (web UI at /files/) ---------------------------------
-FB_DB=/workspace/.filebrowser.db
-FB_ROOT=/workspace
-FB_PORT=8090
-FB_PASSWORD="${FILEBROWSER_PASSWORD:-}"
-if [[ -z "$FB_PASSWORD" ]]; then
-    FB_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16 || echo "comfyforge")"
-    warn "FILEBROWSER_PASSWORD not set — generated random password:"
-    echo "    >>> filebrowser admin password: ${FB_PASSWORD}  <<<"
-fi
-# Initialize DB on first boot only (DB lives on the volume so it persists)
-if [[ ! -f "$FB_DB" ]]; then
-    filebrowser -d "$FB_DB" config init --baseurl /files >/dev/null
-    filebrowser -d "$FB_DB" config set --auth.method=json --baseurl /files >/dev/null
-    filebrowser -d "$FB_DB" users add admin "$FB_PASSWORD" --perm.admin >/dev/null
-    ok "filebrowser initialized (admin user created)"
-else
-    # Update password on every boot in case env var changed
-    filebrowser -d "$FB_DB" users update admin --password "$FB_PASSWORD" >/dev/null 2>&1 || true
-fi
-filebrowser -d "$FB_DB" -r "$FB_ROOT" -a 127.0.0.1 -p "$FB_PORT" -b /files >/var/log/filebrowser.log 2>&1 &
-FB_PID=$!
-ok "filebrowser running on 127.0.0.1:${FB_PORT} (public URL: /files/)"
 
 # ----- Start nginx (proxy with WebSocket support) ----------------------------
 sed -i "s/listen 8188;/listen ${PORT};/" /etc/nginx/conf.d/comfyui.conf
