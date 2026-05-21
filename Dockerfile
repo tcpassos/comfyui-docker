@@ -2,14 +2,16 @@
 #  Docker image pre-configured for ComfyUI on RunPod / Vast.ai
 #  - PyTorch 2.12 + CUDA 13.0 (Blackwell / NVFP4 compatible)
 #  - ComfyUI cloned into /opt/ComfyUI (volume only stores models/nodes/user)
-#  - Sage Attention compiled per-GPU-arch at runtime (see entrypoint.sh)
+#  - Sage Attention provided via prebuilt wheels at boot (see entrypoint.sh)
 # =============================================================================
 
-# Official PyTorch image: torch 2.12 + CUDA 13.0 toolkit + cuDNN9 + nvcc.
-# ~7.6 GB base vs ~14 GB for the previous runpod/pytorch base, and removes the
-# need to reinstall torch on top (saves another ~5 GB of layer overhead).
+# Official PyTorch image — runtime variant (no nvcc, ~3 GB) instead of -devel
+# (~7.6 GB). Saves ~4.5 GB. Sage 2.x is no longer compiled in the pod by
+# default; the entrypoint pulls a prebuilt wheel from $SAGE_PREBUILT_REPO. If
+# you really need to build Sage from source at boot, switch this back to the
+# -devel tag and the entrypoint will detect nvcc and rebuild.
 # Tags at https://hub.docker.com/r/pytorch/pytorch/tags
-ARG BASE_IMAGE=pytorch/pytorch:2.12.0-cuda13.0-cudnn9-devel
+ARG BASE_IMAGE=pytorch/pytorch:2.12.0-cuda13.0-cudnn9-runtime
 FROM ${BASE_IMAGE}
 
 # ----- Build args (editable at build time without rewriting Dockerfile) ------
@@ -22,9 +24,9 @@ ENV COMFYUI_VERSION=${COMFYUI_VERSION} \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
-    DEBIAN_FRONTEND=noninteractive \
-    CUDA_HOME=/usr/local/cuda \
-    PATH=/usr/local/cuda/bin:${PATH}
+    UV_SYSTEM_PYTHON=1 \
+    UV_BREAK_SYSTEM_PACKAGES=1 \
+    DEBIAN_FRONTEND=noninteractive
 
 # ----- System ----------------------------------------------------------------
 # openssh-server is included for Vast.ai compatibility (RunPod injects SSH via
@@ -34,21 +36,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /var/run/sshd \
     && rm -rf /var/lib/apt/lists/*
 
+# ----- uv (Astral) — drop-in pip replacement, ~10-30x faster -----------------
+# Used at boot to install custom-node requirements (single consolidated pass)
+# and to install Sage wheels.
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && mv /root/.local/bin/uv  /usr/local/bin/uv \
+    && (mv /root/.local/bin/uvx /usr/local/bin/uvx 2>/dev/null || true)
+
 # ----- ComfyUI in /opt -------------------------------------------------------
-RUN git clone https://github.com/comfyanonymous/ComfyUI.git "${COMFYUI_HOME}" \
-    && cd "${COMFYUI_HOME}" \
-    && git checkout "${COMFYUI_VERSION}"
+# Shallow clone — drops history (~50 MB smaller, faster build).
+RUN git clone --depth 1 --branch "${COMFYUI_VERSION}" \
+        https://github.com/comfyanonymous/ComfyUI.git "${COMFYUI_HOME}"
 
 # Verify the base image actually provides the expected torch/CUDA stack.
 ENV INSTALL_SAGE=${INSTALL_SAGE}
 RUN python3 -c "import torch, torchvision, torchaudio; print('torch', torch.__version__, 'cuda', torch.version.cuda); assert torch.version.cuda.startswith('13.'), torch.version.cuda"
 
-# ----- ComfyUI requirements + custom-node dependencies -----------------------
-RUN pip install --upgrade-strategy only-if-needed -r "${COMFYUI_HOME}/requirements.txt" \
-    && pip install gitpython toml \
+# ----- ComfyUI requirements + entrypoint helpers -----------------------------
+RUN uv pip install --system -r "${COMFYUI_HOME}/requirements.txt" \
+    && uv pip install --system gitpython toml \
     # kornia 0.8+ removed `pad` from geometry.transform.pyramid, which breaks
     # ComfyUI-LTXVideo's pyramid_blending module. Pin to a working version.
-    && pip install "kornia==0.7.3"
+    && uv pip install --system "kornia==0.7.3"
 
 # ----- Entrypoint + example config + nginx -----------------------------------
 COPY entrypoint.sh /usr/local/bin/comfy-entrypoint

@@ -2,7 +2,7 @@
 # =============================================================================
 #  Entrypoint for the comfyui-cloud image
 #  - Ensures the expected structure under /workspace
-#  - Reads /workspace/config.json (fails fast if missing)
+#  - Reads /workspace/config.json (seeds from /opt/config.example.json if missing)
 #  - Syncs custom_nodes and models
 #  - Starts ComfyUI with --base-directory /workspace
 # =============================================================================
@@ -107,8 +107,10 @@ mkdir -p \
     "${WORKSPACE}/temp"
 
 # Provision config.json if it does not exist on the volume yet.
-# Priority: CONFIG_URL (env) > error (fail-fast, avoids downloading an
-# unwanted default set).
+# Priority: CONFIG_URL (env) > /opt/config.example.json (bundled default).
+# The example is a minimal config (just ComfyUI-Manager + ComfyUI-Lora-Manager,
+# no models) — enough to land a working UI on first boot without forcing the
+# user to provide a config upfront.
 if [[ ! -f "$CONFIG" ]]; then
     if [[ -n "${CONFIG_URL:-}" ]]; then
         log "Downloading config from \$CONFIG_URL → $CONFIG"
@@ -116,10 +118,13 @@ if [[ ! -f "$CONFIG" ]]; then
             err "Failed to download CONFIG_URL: $CONFIG_URL"
             exit 1
         fi
+    elif [[ -f /opt/config.example.json ]]; then
+        log "No CONFIG_URL set and $CONFIG missing — seeding from bundled /opt/config.example.json"
+        log "Edit $CONFIG and restart the pod to add your own nodes/models."
+        cp /opt/config.example.json "$CONFIG"
     else
-        err "Missing $CONFIG and CONFIG_URL is not set."
-        err "Set the CONFIG_URL env var (raw URL of a config.json) OR"
-        err "create $CONFIG manually (e.g. cp /opt/config.example.json $CONFIG) and restart."
+        err "Missing $CONFIG, CONFIG_URL not set, and no bundled example found."
+        err "Set the CONFIG_URL env var or create $CONFIG manually and restart."
         exit 1
     fi
 fi
@@ -128,6 +133,15 @@ fi
 HF_TOKEN="${HF_TOKEN:-}"
 CIVITAI_TOKEN="${CIVITAI_TOKEN:-}"
 UPDATE_NODES="${UPDATE_NODES:-false}"  # if true, git-pull existing nodes
+
+# Prefer uv (Astral) for pip operations — ~10-30x faster than pip and
+# resolves all requirements in a single pass. Falls back to pip if uv isn't
+# installed (e.g. when entrypoint is run outside this image).
+if command -v uv >/dev/null 2>&1; then
+    PIP_INSTALL=(uv pip install --system)
+else
+    PIP_INSTALL=(pip install --upgrade-strategy only-if-needed)
+fi
 
 clone_node() {
     local url="$1" ref="${2:-}" path dir
@@ -148,9 +162,24 @@ clone_node() {
                 || warn "checkout '$ref' failed for $dir (kept HEAD)"
         fi
     fi
-    if [[ -f "$path/requirements.txt" ]]; then
-        pip install --upgrade-strategy only-if-needed -r "$path/requirements.txt" \
-            || warn "requirements for $dir failed"
+    # NOTE: requirements.txt is NOT installed here. After all nodes are
+    # processed, the main loop runs a single consolidated install — the
+    # resolver runs once across every node's requirements instead of N times.
+}
+
+_download_curl() {
+    local url="$1" dest_dir="$2" fname="$3" auth_header="$4"
+    local args=(--fail --location --progress-bar --retry 3 --retry-delay 5 --continue-at -)
+    [[ -n "$auth_header" ]] && args+=(-H "$auth_header")
+    if ! curl "${args[@]}" -o "$dest_dir/$fname" "$url"; then
+        local rc=$?
+        warn "Failed: $url (curl exit ${rc})"
+        [[ -f "$dest_dir/$fname" && ! -s "$dest_dir/$fname" ]] && rm -f "$dest_dir/$fname"
+        if [[ $rc -eq 23 ]]; then
+            err "curl 23 = write failure. Disk full?"
+            df -h "$dest_dir" || true
+        fi
+        return $rc
     fi
 }
 
@@ -162,7 +191,6 @@ download_model() {
         url="${url/\/blob\//\/resolve\/}"
     fi
 
-    # Resolve filename if not provided
     if [[ -z "$fname" || "$fname" == "null" ]]; then
         fname="${url##*/}"; fname="${fname%%\?*}"
     fi
@@ -172,9 +200,9 @@ download_model() {
         return 0
     fi
 
-    local args=(--fail --location --progress-bar --retry 3 --retry-delay 5 --continue-at -)
+    local auth_header=""
     if [[ "$url" =~ ^https://([a-zA-Z0-9_-]+\.)?huggingface\.co ]]; then
-        [[ -n "$HF_TOKEN" ]] && args+=(-H "Authorization: Bearer $HF_TOKEN")
+        [[ -n "$HF_TOKEN" ]] && auth_header="Authorization: Bearer $HF_TOKEN"
     elif [[ "$url" =~ ^https://([a-zA-Z0-9_-]+\.)?civitai\.com ]]; then
         if [[ -n "$CIVITAI_TOKEN" ]]; then
             if [[ "$url" == *"?"* ]]; then url="${url}&token=$CIVITAI_TOKEN"
@@ -183,17 +211,25 @@ download_model() {
     fi
 
     log "Downloading $fname"
-    if ! curl "${args[@]}" -o "$dest_dir/$fname" "$url"; then
-        local rc=$?
-        warn "Failed: $url (curl exit ${rc})"
-        # Remove partial/zero-byte file so the next boot retries cleanly
-        [[ -f "$dest_dir/$fname" && ! -s "$dest_dir/$fname" ]] && rm -f "$dest_dir/$fname"
-        # curl 23 = write error (usually disk full)
-        if [[ $rc -eq 23 ]]; then
-            err "curl 23 = write failure. Disk full?"
-            df -h "$dest_dir" || true
+    # aria2c uses up to 16 parallel connections to a single file — typically
+    # 4-16x faster than curl on multi-GB models from HF / Civitai CDNs.
+    if command -v aria2c >/dev/null 2>&1; then
+        local args=(
+            --console-log-level=warn --summary-interval=10
+            --max-tries=3 --retry-wait=5
+            --max-connection-per-server=16 --split=16 --min-split-size=1M
+            --auto-file-renaming=false --allow-overwrite=true
+            --continue=true
+            --dir="$dest_dir" --out="$fname"
+        )
+        [[ -n "$auth_header" ]] && args+=(--header="$auth_header")
+        if aria2c "${args[@]}" "$url"; then
+            return 0
         fi
+        warn "aria2 failed — retrying with curl"
+        [[ -f "$dest_dir/$fname" && ! -s "$dest_dir/$fname" ]] && rm -f "$dest_dir/$fname"
     fi
+    _download_curl "$url" "$dest_dir" "$fname" "$auth_header"
 }
 
 # ----- Process config.json ---------------------------------------------------
@@ -224,6 +260,23 @@ for ((i=0; i<NUM_NODES; i++)); do
         clone_node "$url" "$ref"
     fi
 done
+
+# Consolidated dependency install — passing all requirements.txt files to a
+# single resolver invocation is dramatically faster than installing per-node,
+# since pip/uv resolves shared dependencies (torch, numpy, transformers, ...)
+# only once instead of N times.
+REQ_ARGS=()
+REQ_COUNT=0
+for req in "${WORKSPACE}/custom_nodes/"*/requirements.txt; do
+    [[ -f "$req" ]] || continue
+    REQ_ARGS+=(-r "$req")
+    REQ_COUNT=$((REQ_COUNT + 1))
+done
+if (( REQ_COUNT > 0 )); then
+    log "Installing custom-node dependencies (${REQ_COUNT} requirements files, single pass via ${PIP_INSTALL[0]})"
+    "${PIP_INSTALL[@]}" "${REQ_ARGS[@]}" \
+        || warn "Some custom-node dependencies failed to install (see log above)"
+fi
 
 # Models (array of objects {category|path, url, filename?})
 # - `path` (optional): destination override, relative to $WORKSPACE (or absolute).
@@ -260,14 +313,19 @@ if (( NUM_WF > 0 )); then
 fi
 
 # ----- Sage Attention build (runtime, GPU-arch specific) ---------------------
-# Sage 2.x must be built from source for the target GPU's compute capability
-# (Blackwell sm_120, Ada sm_89, Hopper sm_90, Ampere sm_86). Building all
-# archs at image-build time peaks ~22 GB RAM (the _fused.so link step), which
-# OOMs Docker Desktop. Compiling only the device's arch at runtime keeps RAM
-# under ~6 GB and finishes in ~5 min on a modern GPU.
+# Sage 2.x must match the target GPU's compute capability
+# (Blackwell sm_120, Ada sm_89, Hopper sm_90, Ampere sm_86, ...). The base
+# image is the `-runtime` PyTorch tag (no nvcc), so building from source isn't
+# available by default.
 #
-# The wheel is cached at $WORKSPACE/cache/sage_wheels/ so subsequent boots of
-# the same instance type (same GPU arch) skip the rebuild and just pip install.
+# Install order (first that works wins):
+#   1. Cached wheel at $WORKSPACE/cache/sage_wheels/ (from a previous boot).
+#   2. Prebuilt wheel from $SAGE_PREBUILT_REPO (default
+#      tcpassos/sage-wheels-linux) matching torch/cuda/python/SM of the
+#      running container. Disable with SAGE_PREBUILT=false.
+#   3. Compile from source — ONLY if nvcc is present (i.e. image was rebuilt
+#      from a -devel base). Result is cached for future boots.
+#   4. Fall back to PyPI sageattention (Sage 1.x, missing per_warp_int8_cuda).
 if [[ "${INSTALL_SAGE:-true}" == "true" ]]; then
     # Sage 2.x exposes per_warp_int8_cuda (KJNodes LTX2 patch uses it).
     # The PyPI 1.0.6 fallback does NOT export it, so this check distinguishes.
@@ -281,35 +339,120 @@ if [[ "${INSTALL_SAGE:-true}" == "true" ]]; then
             SM="${ARCH//./}"
             CACHE_DIR="${WORKSPACE}/cache/sage_wheels"
             mkdir -p "$CACHE_DIR"
-            CACHED=$(ls "${CACHE_DIR}"/sageattention-*-sm${SM}.whl 2>/dev/null | head -1)
+            # The PEP 427 build tag in the wheel filename already encodes the SM
+            # (sageattention-<ver>-<SM>-cp<py>-cp<py>-linux_x86_64.whl).
+            CACHED=$(ls "${CACHE_DIR}"/sageattention-*-${SM}-cp${PY_DIGITS:-*}-cp${PY_DIGITS:-*}-*.whl 2>/dev/null | head -1)
             if [[ -n "$CACHED" && -f "$CACHED" ]]; then
                 log "Installing cached Sage wheel for sm_${SM}: $(basename "$CACHED")"
                 pip install --no-deps --force-reinstall "$CACHED" \
                     && ok "Sage installed from cache" \
                     || warn "Cached wheel install failed"
             else
-                log "Building Sage 2.x for sm_${SM} (compute cap $ARCH) — ~5 min, ~6 GB RAM"
-                pip uninstall -y sageattention 2>/dev/null || true
-                BUILD_TMP=$(mktemp -d)
-                if TORCH_CUDA_ARCH_LIST="$ARCH" \
-                   MAX_JOBS="${SAGE_BUILD_JOBS:-4}" \
-                   pip wheel --no-build-isolation --no-deps \
-                       -w "$BUILD_TMP" \
-                       git+https://github.com/thu-ml/SageAttention.git; then
-                    BUILT=$(ls "$BUILD_TMP"/sageattention-*.whl 2>/dev/null | head -1)
-                    if [[ -n "$BUILT" ]]; then
-                        NAME=$(basename "$BUILT" .whl)
-                        cp "$BUILT" "${CACHE_DIR}/${NAME}-sm${SM}.whl"
-                        pip install --no-deps "$BUILT" \
-                            && ok "Sage 2.x compiled, cached and installed for sm_${SM}"
+                # ---------- Try a prebuilt wheel from GitHub releases --------
+                # Repo layout: each release tag encodes the runtime that the
+                # wheels target, e.g.
+                #   sage-2.2.0-torch-2.12.0-cu130-py312
+                # and the assets are
+                #   sageattention-<ver>-<SM>-cp<py>-cp<py>-linux_x86_64.whl
+                # We pick the newest release whose tag matches the current
+                # torch/cuda/python combo and that ships a wheel for this SM.
+                SAGE_PREBUILT_REPO="${SAGE_PREBUILT_REPO:-tcpassos/sage-wheels-linux}"
+                INSTALLED_FROM_PREBUILT=false
+                if [[ "${SAGE_PREBUILT:-true}" == "true" ]]; then
+                    TORCH_VER=$(python3 -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null || true)
+                    CUDA_RAW=$(python3 -c 'import torch; print((torch.version.cuda or "").replace(".",""))' 2>/dev/null || true)
+                    PY_DIGITS=$(python3 -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || true)
+                    if [[ -n "$TORCH_VER" && -n "$CUDA_RAW" && -n "$PY_DIGITS" ]]; then
+                        TAG_SUFFIX="torch-${TORCH_VER}-cu${CUDA_RAW}-py${PY_DIGITS}"
+                        log "Looking for prebuilt Sage wheel: ${SAGE_PREBUILT_REPO} matching ${TAG_SUFFIX}, sm_${SM}"
+                        # Plain GitHub REST works unauthenticated for public repos.
+                        # GH_TOKEN raises the rate limit (60 → 5000/h) when set.
+                        api_headers=(-H "Accept: application/vnd.github+json")
+                        [[ -n "${GH_TOKEN:-}" ]] && api_headers+=(-H "Authorization: Bearer $GH_TOKEN")
+                        releases_json=$(curl -fsSL "${api_headers[@]}" \
+                            "https://api.github.com/repos/${SAGE_PREBUILT_REPO}/releases?per_page=50" 2>/dev/null || echo "")
+                        if [[ -n "$releases_json" ]]; then
+                            # Walk releases newest-first, pick first asset whose
+                            # name matches sageattention-*-${SM}-cp${PY_DIGITS}-*.whl
+                            # inside a release tagged with $TAG_SUFFIX.
+                            asset_url=$(echo "$releases_json" | jq -r --arg suf "$TAG_SUFFIX" \
+                                --arg sm  "$SM" --arg py "$PY_DIGITS" '
+                                map(select(.tag_name | contains($suf)))
+                                | .[].assets[]?
+                                | select(.name | test("sageattention-[^-]+-\($sm)-cp\($py)-"))
+                                | .browser_download_url' 2>/dev/null | head -1)
+                            asset_name=$(echo "$releases_json" | jq -r --arg suf "$TAG_SUFFIX" \
+                                --arg sm  "$SM" --arg py "$PY_DIGITS" '
+                                map(select(.tag_name | contains($suf)))
+                                | .[].assets[]?
+                                | select(.name | test("sageattention-[^-]+-\($sm)-cp\($py)-"))
+                                | .name' 2>/dev/null | head -1)
+                            if [[ -n "$asset_url" && -n "$asset_name" ]]; then
+                                log "Found prebuilt: $asset_name → downloading"
+                                DL_PATH="${CACHE_DIR}/${asset_name}"
+                                if curl -fsSL --retry 3 --retry-delay 5 \
+                                        "${api_headers[@]}" \
+                                        -o "$DL_PATH" "$asset_url"; then
+                                    if pip install --no-deps --force-reinstall "$DL_PATH"; then
+                                        ok "Sage installed from prebuilt release"
+                                        INSTALLED_FROM_PREBUILT=true
+                                    else
+                                        warn "Prebuilt wheel install failed — will fall back to build"
+                                        rm -f "$DL_PATH"
+                                    fi
+                                else
+                                    warn "Prebuilt wheel download failed — will fall back to build"
+                                fi
+                            else
+                                log "No prebuilt wheel for ${TAG_SUFFIX} / sm_${SM} — falling back to build"
+                            fi
+                        else
+                            warn "Could not query ${SAGE_PREBUILT_REPO} releases — falling back to build"
+                        fi
                     else
-                        warn "Build succeeded but no wheel found in $BUILD_TMP"
+                        warn "Could not detect torch/cuda/py — falling back to build"
                     fi
-                else
-                    warn "Sage 2.x build failed — falling back to PyPI sageattention"
-                    pip install sageattention || warn "PyPI fallback also failed"
                 fi
-                rm -rf "$BUILD_TMP"
+                # ---------- Build from source (fallback) ---------------------
+                if [[ "$INSTALLED_FROM_PREBUILT" != "true" ]]; then
+                    if ! command -v nvcc >/dev/null 2>&1; then
+                        warn "nvcc not found in this image (runtime base) — cannot build Sage from source"
+                        warn "No prebuilt wheel matched torch=${TORCH_VER:-?} cuda=cu${CUDA_RAW:-?} py=${PY_DIGITS:-?} sm_${SM}."
+                        warn "Options: (a) add a release at ${SAGE_PREBUILT_REPO} that ships this combo,"
+                        warn "         (b) rebuild this image FROM a -devel base (pytorch/pytorch:*-devel)."
+                        warn "Falling back to PyPI sageattention (Sage 1.x — lacks per_warp_int8_cuda)"
+                        ${PIP_INSTALL[@]} sageattention || warn "PyPI fallback also failed"
+                    else
+                        log "Building Sage 2.x for sm_${SM} (compute cap $ARCH) — ~5 min, ~6 GB RAM"
+                        pip uninstall -y sageattention 2>/dev/null || true
+                        BUILD_TMP=$(mktemp -d)
+                        if TORCH_CUDA_ARCH_LIST="$ARCH" \
+                           MAX_JOBS="${SAGE_BUILD_JOBS:-4}" \
+                           pip wheel --no-build-isolation --no-deps \
+                               -w "$BUILD_TMP" \
+                               git+https://github.com/thu-ml/SageAttention.git; then
+                            BUILT=$(ls "$BUILD_TMP"/sageattention-*.whl 2>/dev/null | head -1)
+                            if [[ -n "$BUILT" ]]; then
+                                # Inject the SM as PEP 427 build tag so multiple
+                                # GPU archs can coexist in the cache without
+                                # clobbering each other. setup.py emits a plain
+                                # sageattention-<ver>-cp<py>-cp<py>-<plat>.whl
+                                # without a build tag; we splice -${SM}- in.
+                                BASE=$(basename "$BUILT")
+                                TAGGED="${BASE/-cp/-${SM}-cp}"
+                                cp "$BUILT" "${CACHE_DIR}/${TAGGED}"
+                                pip install --no-deps "${CACHE_DIR}/${TAGGED}" \
+                                    && ok "Sage 2.x compiled, cached and installed for sm_${SM}"
+                            else
+                                warn "Build succeeded but no wheel found in $BUILD_TMP"
+                            fi
+                        else
+                            warn "Sage 2.x build failed — falling back to PyPI sageattention"
+                            pip install sageattention || warn "PyPI fallback also failed"
+                        fi
+                        rm -rf "$BUILD_TMP"
+                    fi
+                fi
             fi
         fi
     fi

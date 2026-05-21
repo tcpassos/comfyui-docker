@@ -1,46 +1,14 @@
 {
-  "_comment": "Edite este arquivo em /workspace/config.json e reinicie o pod para aplicar.",
+  "_comment": "Edit this file at /workspace/config.json and restart the pod to apply. This default ships with just two essential nodes (a node manager and a LoRA manager); add models/workflows as needed.",
 
   "nodes": [
-    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
-    "https://github.com/rgthree/rgthree-comfy",
-    "https://github.com/Artificial-Sweetener/comfyui-WhiteRabbit",
-    "https://github.com/kijai/ComfyUI-KJNodes",
-    "https://github.com/city96/ComfyUI-GGUF",
-    "https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes",
-    "https://github.com/Lightricks/ComfyUI-LTXVideo",
-    "https://github.com/ltdrdata/ComfyUI-Impact-Pack",
-    "https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI"
+    "https://github.com/ltdrdata/ComfyUI-Manager",
+    "https://github.com/willmiao/ComfyUI-Lora-Manager"
   ],
 
-  "models": [
-    {
-      "category": "diffusion_models",
-      "url": "https://civitai.com/api/download/models/2955692",
-      "filename": "dasiwa-wan_2_2_i2v_14b_lightspeed_nvfp4_snatchkiss_low_v11.safetensors"
-    },
-    {
-      "category": "diffusion_models",
-      "url": "https://civitai.com/api/download/models/2955688",
-      "filename": "dasiwa-wan_2_2_i2v_14b_lightspeed_nvfp4_snatchkiss_high_v11.safetensors"
-    },
-    {
-      "category": "vae",
-      "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors",
-      "filename": "wan_2.1_vae.safetensors"
-    },
-    {
-      "category": "text_encoders",
-      "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-      "filename": "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-    },
-    {
-      "category": "frame_interpolation",
-      "url": "https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/frame_interpolation/rife_v4.26.safetensors",
-      "filename": "rife_v4.26.safetensors"
-    }
-  ],
+  "_models_comment": "Models to download into /workspace/models/<category>. Supports HuggingFace, Civitai (set CIVITAI_API_KEY for gated downloads), and any raw URL.",
+  "models": [],
 
-  "_workflows_comment": "Opcional. Baixa para /workspace/user/default/workflows/. Suporta Gist, raw GitHub, HF, etc.",
+  "_workflows_comment": "Optional. Downloads into /workspace/user/default/workflows/. Supports Gist, raw GitHub, HF, etc.",
   "workflows": []
 }

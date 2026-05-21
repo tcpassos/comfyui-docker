@@ -7,10 +7,11 @@ Everything heavy ships in the image; what changes per workflow lives in `/worksp
 
 | Item | Location | Persistent? |
 |---|---|---|
-| ComfyUI, Python, torch, sage attention, ffmpeg | `/opt/ComfyUI` (in the image) | No (ships with the image) |
+| ComfyUI, Python, torch, uv, aria2, ffmpeg | `/opt/ComfyUI` (in the image) | No (ships with the image) |
 | Custom nodes | `/workspace/custom_nodes` | Yes (volume) |
 | Models | `/workspace/models/<category>` | Yes (volume) |
 | Workflows, outputs, ComfyUI configs | `/workspace/user`, `/workspace/output` | Yes (volume) |
+| SageAttention wheel cache | `/workspace/cache/sage_wheels` | Yes (volume) |
 | List of nodes + models to download | `/workspace/config.json` | Yes (volume) |
 
 ## Build
@@ -20,7 +21,7 @@ docker build -t tcpassos/comfyui-cloud:latest C:\dev\comfyui-docker
 docker push tcpassos/comfyui-cloud:latest
 ```
 
-> Final size: ~16 GB. Build takes ~10–15 min on a good connection (the RunPod base image is already ~9 GB).
+> Final size: ~7.2 GB (using the `pytorch/pytorch:*-runtime` base; the previous `-devel` base produced an image of ~16 GB). Build takes ~5–10 min on a good connection.
 
 (Optional) Change ComfyUI version at build time:
 ```powershell
@@ -30,19 +31,55 @@ docker build --build-arg COMFYUI_VERSION=v0.22.0 -t tcpassos/comfyui-cloud:v0.22
 ### Validate the image locally (smoke test)
 
 ```powershell
-docker run --rm --entrypoint python3 tcpassos/comfyui-cloud:latest -c "import torch, torchvision, torchaudio, xformers, sageattention; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'tv', torchvision.__version__, 'ta', torchaudio.__version__, 'xf', xformers.__version__)"
+docker run --rm --entrypoint python3 tcpassos/comfyui-cloud:latest -c "import torch, torchvision, torchaudio; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'tv', torchvision.__version__, 'ta', torchaudio.__version__)"
 ```
 
 Expected output:
 ```
-torch 2.12.0+cu130 cuda 13.0 tv 0.27.0+cu130 ta 2.11.0+cu130 xf 0.0.35
+torch 2.12.0+cu130 cuda 13.0 tv 0.27.0+cu130 ta 2.11.0+cu130
 ```
 
 > The `--entrypoint python3` flag is required; otherwise the image's ENTRYPOINT runs the full node/model provisioning before your command.
+>
+> `sageattention` is NOT in the image — it is installed at boot (prebuilt wheel from `$SAGE_PREBUILT_REPO` matching your GPU's SM). See *About SageAttention install order* below.
 
-### About xformers
+### About SageAttention install order
 
-The image installs `xformers==0.0.35` but its official wheel was built against **torch 2.10/cu128/py3.10** while this image uses **torch 2.12/cu130/py3.12** — the module imports, but its CUDA extensions (memory-efficient attention, SwiGLU) stay disabled with a warning. Use **sageattention** as your main optimization path (installed and functional — pure Triton, no compiled extension).
+Sage 2.x has to match the GPU's compute capability (SM 75/80/86/89/90/120),
+so it can't ship in the image. The entrypoint resolves it at boot in this
+order — first one that succeeds wins:
+
+1. **Volume cache**: `/workspace/cache/sage_wheels/sageattention-<ver>-<SM>-cp<py>-cp<py>-linux_x86_64.whl`
+   left from a previous boot of the same instance type.
+2. **Prebuilt release**: GitHub release on `$SAGE_PREBUILT_REPO`
+   (default [`tcpassos/sage-wheels-linux`](https://github.com/tcpassos/sage-wheels-linux))
+   whose tag matches the running `torch-X-cuY-pyZ` combo and that ships a
+   wheel for the GPU's SM. Downloaded into the volume cache, so step 1
+   handles future boots.
+3. **Local source build** for the detected SM — **only if the image was
+   built FROM a `pytorch/pytorch:*-devel` base** (the default `-runtime`
+   base ships no nvcc). ~5 min, ~6 GB RAM when available. Also cached.
+4. **PyPI `sageattention`** (Sage 1.x) as last resort — works but lacks
+   `per_warp_int8_cuda` used by some custom nodes.
+
+Set `SAGE_PREBUILT=false` to skip step 2, or `INSTALL_SAGE=false` to skip
+the whole Sage setup.
+
+### Boot-time speed optimizations
+
+The image trades the heavy `-devel` base + `pip` for a leaner stack:
+
+- **`pytorch/pytorch:*-runtime` base** (~3 GB vs ~7.6 GB for `-devel`).
+  Removes nvcc; Sage now comes from prebuilt wheels (see above).
+- **[uv](https://github.com/astral-sh/uv)** replaces `pip` for the boot-time
+  install of custom-node dependencies — typically 10–30× faster, with a
+  single resolver pass across all `requirements.txt` files instead of one
+  pass per node.
+- **`aria2c`** replaces `curl` for model downloads, using up to 16 parallel
+  connections per file — typically 4–16× faster for multi-GB models from
+  HuggingFace / Civitai CDNs. Falls back to `curl` automatically on error.
+- **`git clone --depth 1`** for ComfyUI — drops history, ~50 MB smaller and
+  marginally faster build.
 
 ## RunPod setup
 
@@ -67,9 +104,14 @@ RunPod Console → **Templates** → **+ New Template**:
 |---|---|
 | `HF_TOKEN` | your HuggingFace token (read) |
 | `CIVITAI_TOKEN` | your Civitai token |
-| `CONFIG_URL` | **required** if `/workspace/config.json` does not yet exist in the volume. Public URL (Gist / raw GitHub) of a `config.json`. If missing and no config exists in the volume, the entrypoint aborts with a clear error (prevents accidental download of an unintended default set). |
+| `CONFIG_URL` | **optional**. Public URL (Gist / raw GitHub) of a `config.json`. If unset *and* `/workspace/config.json` does not yet exist in the volume, the entrypoint seeds `/workspace/config.json` from the bundled `/opt/config.example.json` (a minimal two-node setup with ComfyUI-Manager and ComfyUI-Lora-Manager). |
 | `UPDATE_NODES` | `false` (default) — does not update existing custom nodes on boot, keeping deploys reproducible. `true` runs `git pull --ff-only` on every node without a pinned `ref`. |
 | `PORT` | `8188` (optional, default is 8188) |
+| `INSTALL_SAGE` | `true` (default) — install SageAttention 2.x at boot if not already present. Set to `false` to skip entirely. |
+| `SAGE_PREBUILT` | `true` (default) — before building from source, try to download a prebuilt wheel from `$SAGE_PREBUILT_REPO` matching the running torch / CUDA / Python / GPU SM. Set to `false` to force a local build. |
+| `SAGE_PREBUILT_REPO` | `tcpassos/sage-wheels-linux` (default) — GitHub `owner/name` to look up prebuilt Sage wheels from. |
+| `SAGE_BUILD_JOBS` | `4` (default) — `MAX_JOBS` passed to the source build when the prebuilt path is skipped/unavailable. Lower it on small instances (1 for 4–8 GB RAM, 2 for 8–16 GB). |
+| `GH_TOKEN` | optional — GitHub token used only to raise the public REST API rate limit (60 → 5000 req/h) when querying releases. Not required for public repos. |
 
 ### 2. Deploy the pod
 
@@ -84,14 +126,14 @@ Deploy → wait for "Running".
 ### 3. First boot
 
 **Takes 5–15 min** because the entrypoint will:
-1. Download `config.json` from `CONFIG_URL` to `/workspace/config.json` (if not set, **the pod aborts** — protection against accidental deploys without a defined config).
+1. Resolve `config.json`: download from `CONFIG_URL` if set, else fall back to the bundled `/opt/config.example.json` (minimal two-node example).
 2. Clone the custom nodes listed in `nodes[]`.
 3. `pip install` the requirements of each node.
 4. Download the models listed in `models[]` (HF / Civitai using the tokens from the env vars).
 
 Follow along in **Connect → Logs**. When you see `Starting ComfyUI on port 8188`, you're ready.
 
-> Without `CONFIG_URL` set and without a pre-populated volume: the entrypoint prints instructions and exits with code 1. Check the logs and either (a) set `CONFIG_URL` on the template, or (b) SSH into the pod and `cp /opt/config.example.json /workspace/config.json` to use the embedded example set.
+> Without `CONFIG_URL` set and without a pre-populated volume: the entrypoint seeds `/workspace/config.json` from `/opt/config.example.json` (ComfyUI-Manager + ComfyUI-Lora-Manager, no models). Edit the file on the volume and restart the pod to customize.
 
 ### 4. Connect
 
@@ -127,7 +169,7 @@ Vast.ai Console → **Templates** → **New Template**:
 |---|---|
 | `HF_TOKEN` | your HuggingFace token (read) |
 | `CIVITAI_TOKEN` | your Civitai token |
-| `CONFIG_URL` | **required** — same as RunPod (public URL of a `config.json`) |
+| `CONFIG_URL` | **optional** — same as RunPod (public URL of a `config.json`). If unset, the entrypoint seeds from the bundled example. |
 | `PUBLIC_KEY` (or `SSH_PUBLIC_KEY`) | your SSH public key (one line) — the entrypoint writes it to `/root/.ssh/authorized_keys` and starts `sshd` |
 | `UPDATE_NODES` | `false` (default) / `true` |
 | `OPEN_BUTTON_PORT` | `8188` — makes Vast's "Open" button point to ComfyUI |
