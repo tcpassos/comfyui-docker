@@ -96,6 +96,45 @@ check_disk() {
 check_disk "/"           "Container Disk" 15
 check_disk "$WORKSPACE"  "Volume"         5
 
+# ----- Pre-flight: GPU / driver compatibility --------------------------------
+# Catches the most expensive failure mode: pod with NVIDIA driver too old for
+# the image's CUDA runtime. Without this, the user discovers the mismatch only
+# after ~40 min of model downloads, when ComfyUI fails to import torch.cuda.
+# torch._C._cuda_init() is the exact call ComfyUI makes at startup, so if it
+# succeeds here, it will succeed there too.
+preflight_gpu() {
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        err "========================================================="
+        err " nvidia-smi not found"
+        err " This pod has no NVIDIA runtime. Pick a GPU pod and retry."
+        err "========================================================="
+        return 1
+    fi
+    local driver gpu
+    driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+    gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+    ok "GPU: ${gpu:-unknown} | driver: ${driver:-unknown}"
+
+    if ! python3 -c "import torch; torch._C._cuda_init()" >/tmp/cuda-preflight.log 2>&1; then
+        err "========================================================="
+        err " CUDA INITIALIZATION FAILED"
+        err " Image requires NVIDIA driver compatible with the CUDA"
+        err " runtime baked into this PyTorch build."
+        err " Detected driver: ${driver:-unknown}"
+        err " Fix: on RunPod / Vast.ai, filter pods by a higher"
+        err " 'CUDA Version' (e.g. >=13.0) and redeploy."
+        err " ----- torch error -----"
+        sed 's/^/   /' /tmp/cuda-preflight.log >&2
+        err "========================================================="
+        return 1
+    fi
+    ok "CUDA init OK"
+}
+if ! preflight_gpu; then
+    err "Aborting before downloading models — refusing to burn pod time on a broken host."
+    exit 1
+fi
+
 # ----- Volume structure ------------------------------------------------------
 mkdir -p \
     "${WORKSPACE}/models" \
@@ -210,7 +249,25 @@ download_model() {
         fi
     fi
 
-    log "Downloading $fname"
+    # HuggingFace URLs: try huggingface_hub + hf_transfer first. Falls through
+    # to aria2c/curl on any failure (network, parse, transfer crash).
+    if [[ "$url" =~ ^https://huggingface\.co/(datasets/)?([^/]+/[^/]+)/resolve/([^/?#]+)/([^?#]+) ]]; then
+        local hf_repo_prefix="${BASH_REMATCH[1]}"
+        local hf_repo_id="${BASH_REMATCH[2]}"
+        local hf_revision="${BASH_REMATCH[3]}"
+        local hf_path_in_repo="${BASH_REMATCH[4]}"
+        local hf_repo_type="model"
+        [[ -n "$hf_repo_prefix" ]] && hf_repo_type="dataset"
+        log "Downloading $fname (hf_transfer)"
+        if _download_hf_transfer "$hf_repo_type" "$hf_repo_id" "$hf_revision" \
+                                 "$hf_path_in_repo" "$dest_dir" "$fname"; then
+            return 0
+        fi
+        warn "hf_transfer failed — retrying with aria2c"
+    else
+        log "Downloading $fname"
+    fi
+
     # aria2c uses up to 16 parallel connections to a single file — typically
     # 4-16x faster than curl on multi-GB models from HF / Civitai CDNs.
     if command -v aria2c >/dev/null 2>&1; then
@@ -230,6 +287,46 @@ download_model() {
         [[ -f "$dest_dir/$fname" && ! -s "$dest_dir/$fname" ]] && rm -f "$dest_dir/$fname"
     fi
     _download_curl "$url" "$dest_dir" "$fname" "$auth_header"
+}
+
+# huggingface_hub.hf_hub_download with HF_HUB_ENABLE_HF_TRANSFER=1 uses the
+# hf_transfer Rust binary for ranged parallel downloads (~2-3x aria2c on HF's
+# CDN). The library always writes to {local_dir}/{path_in_repo} preserving
+# subdirs, so we download to a temp dir and move the leaf file to {dest}/{fname}
+# to keep the flat layout expected by ComfyUI's loaders.
+_download_hf_transfer() {
+    local repo_type="$1" repo_id="$2" revision="$3" path_in_repo="$4"
+    local dest_dir="$5" fname="$6"
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    if ! HF_HUB_ENABLE_HF_TRANSFER=1 python3 - <<PY
+import os, sys
+from huggingface_hub import hf_hub_download
+try:
+    hf_hub_download(
+        repo_id="$repo_id",
+        filename="$path_in_repo",
+        revision="$revision",
+        repo_type="$repo_type",
+        local_dir="$tmp_dir",
+        token=os.environ.get("HF_TOKEN") or None,
+    )
+except Exception as e:
+    print(f"hf_hub_download error: {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    local downloaded="$tmp_dir/$path_in_repo"
+    if [[ ! -s "$downloaded" ]]; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    mv "$downloaded" "$dest_dir/$fname"
+    rm -rf "$tmp_dir"
+    return 0
 }
 
 # ----- Process config.json ---------------------------------------------------

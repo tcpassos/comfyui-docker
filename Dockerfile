@@ -53,8 +53,10 @@ ENV INSTALL_SAGE=${INSTALL_SAGE}
 RUN python3 -c "import torch, torchvision, torchaudio; print('torch', torch.__version__, 'cuda', torch.version.cuda); assert torch.version.cuda.startswith('13.'), torch.version.cuda"
 
 # ----- ComfyUI requirements + entrypoint helpers -----------------------------
+# huggingface_hub[hf_transfer] enables the Rust-based parallel downloader
+# (HF_HUB_ENABLE_HF_TRANSFER=1) used by the entrypoint for HuggingFace URLs.
 RUN uv pip install --system -r "${COMFYUI_HOME}/requirements.txt" \
-    && uv pip install --system gitpython toml \
+    && uv pip install --system gitpython toml "huggingface_hub[hf_transfer]" \
     # kornia 0.8+ removed `pad` from geometry.transform.pyramid, which breaks
     # ComfyUI-LTXVideo's pyramid_blending module. Pin to a working version.
     && uv pip install --system "kornia==0.7.3"

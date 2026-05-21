@@ -78,6 +78,17 @@ The image trades the heavy `-devel` base + `pip` for a leaner stack:
 - **`aria2c`** replaces `curl` for model downloads, using up to 16 parallel
   connections per file — typically 4–16× faster for multi-GB models from
   HuggingFace / Civitai CDNs. Falls back to `curl` automatically on error.
+- **`hf_transfer`** is preferred for HuggingFace URLs of the form
+  `huggingface.co/{repo}/resolve/{ref}/{path}`. The Rust-based ranged
+  downloader from `huggingface_hub[hf_transfer]` typically runs 2–3×
+  faster than aria2c on HF's CDN. Falls back to aria2c automatically on
+  any failure (parse, network, transfer crash).
+- **Pre-flight GPU check** at boot: before any download, the entrypoint
+  runs `nvidia-smi` and `torch._C._cuda_init()` (the same call ComfyUI
+  makes at startup). If the host's NVIDIA driver is too old for the
+  image's CUDA runtime, the pod aborts in <1s with a clear message
+  instead of burning ~40 min on doomed model downloads. Pick a pod with
+  a higher "CUDA Version" filter and redeploy.
 - **`git clone --depth 1`** for ComfyUI — drops history, ~50 MB smaller and
   marginally faster build.
 
@@ -117,7 +128,7 @@ RunPod Console → **Templates** → **+ New Template**:
 
 Templates → your template → **Deploy**:
 
-- **GPU**: RTX PRO 4500 Blackwell (or any GPU whose driver supports CUDA 12.x+; the image ships CUDA 13).
+- **GPU**: any GPU whose host driver supports CUDA 13.0 (NVIDIA driver ≥ 580). Use the **CUDA Version** filter in RunPod / Vast.ai to narrow the list — the entrypoint's pre-flight will abort early with a clear message if you pick an incompatible pod.
 - **Volume**: ✅ enable to persist `/workspace` across stops.
 - **Region**: any; prefer the same region where you already have a volume if reusing it.
 
