@@ -55,12 +55,11 @@ ENV INSTALL_SAGE=${INSTALL_SAGE}
 RUN python3 -c "import torch, torchvision, torchaudio; print('torch', torch.__version__, 'cuda', torch.version.cuda); assert torch.version.cuda.split('.')[0] in ('12','13'), torch.version.cuda"
 
 # ----- ComfyUI requirements + entrypoint helpers -----------------------------
-# hf_transfer is the Rust-based parallel downloader used by the entrypoint for
-# HuggingFace URLs when HF_HUB_ENABLE_HF_TRANSFER=1. In huggingface_hub 1.x
-# the `[hf_transfer]` extra was removed (hf-xet replaced it as the bundled
-# accelerator), so install hf_transfer as a standalone package alongside it.
+# huggingface_hub 1.x bundles hf-xet as its high-performance transfer backend
+# (replaces the old hf_transfer package). The entrypoint uses
+# HF_XET_HIGH_PERFORMANCE=1 — no extra install needed beyond huggingface_hub.
 RUN uv pip install --system -r "${COMFYUI_HOME}/requirements.txt" \
-    && uv pip install --system gitpython toml huggingface_hub hf_transfer \
+    && uv pip install --system gitpython toml huggingface_hub \
     # kornia 0.8+ removed `pad` from geometry.transform.pyramid, which breaks
     # ComfyUI-LTXVideo's pyramid_blending module. Pin to a working version.
     && uv pip install --system "kornia==0.7.3"

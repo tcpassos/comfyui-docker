@@ -8,6 +8,7 @@ Everything heavy ships in the image; what changes per workflow lives in `/worksp
 | Tag                                 | Base image                                            | torch          | CUDA  | Min NVIDIA driver | Paired Sage release                  | When to pick                                                                                  |
 |-------------------------------------|-------------------------------------------------------|----------------|-------|-------------------|--------------------------------------|-----------------------------------------------------------------------------------------------|
 | `tcpassos/comfyui-cloud:latest`     | `pytorch/pytorch:2.12.0-cuda13.0-cudnn9-runtime`      | 2.12.0+cu130   | 13.0  | R580+             | `sage-2.2.0-torch-2.12.0-cu130-py312` | Default. Blackwell (RTX 5090, B200) and any pod whose host advertises CUDA ≥ 13.              |
+| `tcpassos/comfyui-cloud:cu130`      | *(alias for `latest`, same image ID)*                 | 2.12.0+cu130   | 13.0  | R580+             | `sage-2.2.0-torch-2.12.0-cu130-py312` | Explicit pin when you want CUDA 13 but don't want to follow a moving `latest`.                |
 | `tcpassos/comfyui-cloud:cu128`      | `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime`      | 2.11.0+cu128   | 12.8  | R555+             | `sage-2.2.0-torch-2.11.0-cu128-py312` | Older drivers (A40, A100, L40 on hosts stuck on R5xx). Pre-flight aborts `:latest` on these.  |
 
 Both tags ship the same entrypoint, nginx setup, custom-node provisioning and pre-flight GPU check. The only difference is the torch / CUDA stack baked into the base image. The entrypoint queries [`tcpassos/sage-wheels-linux`](https://github.com/tcpassos/sage-wheels-linux) at boot and pulls the wheel whose `torch-X-cuY-pyZ` tag matches the running container and whose SM matches the detected GPU.
@@ -31,7 +32,9 @@ The Dockerfile defaults to the CUDA 13 base (image tag `:latest`):
 
 ```powershell
 docker build -t tcpassos/comfyui-cloud:latest C:\dev\comfyui-docker
+docker tag tcpassos/comfyui-cloud:latest tcpassos/comfyui-cloud:cu130
 docker push tcpassos/comfyui-cloud:latest
+docker push tcpassos/comfyui-cloud:cu130
 ```
 
 Build the CUDA 12.8 variant from the **same Dockerfile** via `--build-arg BASE_IMAGE`:
@@ -100,11 +103,11 @@ The image trades the heavy `-devel` base + `pip` for a leaner stack:
 - **`aria2c`** replaces `curl` for model downloads, using up to 16 parallel
   connections per file — typically 4–16× faster for multi-GB models from
   HuggingFace / Civitai CDNs. Falls back to `curl` automatically on error.
-- **`hf_transfer`** is preferred for HuggingFace URLs of the form
-  `huggingface.co/{repo}/resolve/{ref}/{path}`. The Rust-based ranged
-  downloader from `huggingface_hub[hf_transfer]` typically runs 2–3×
-  faster than aria2c on HF's CDN. Falls back to aria2c automatically on
-  any failure (parse, network, transfer crash).
+- **`hf-xet`** is used for HuggingFace URLs of the form
+  `huggingface.co/{repo}/resolve/{ref}/{path}` via `huggingface_hub`'s
+  built-in high-performance backend (`HF_XET_HIGH_PERFORMANCE=1`). Bundled
+  as a mandatory dep of `huggingface_hub` 1.x — no separate install needed.
+  Falls back to aria2c automatically on any failure (parse, network, transfer crash).
 - **Pre-flight GPU check** at boot: before any download, the entrypoint
   runs `nvidia-smi` and `torch._C._cuda_init()` (the same call ComfyUI
   makes at startup). If the host's NVIDIA driver is too old for the
@@ -151,7 +154,7 @@ RunPod Console → **Templates** → **+ New Template**:
 Templates → your template → **Deploy**:
 
 - **GPU**: pick the tag that matches the host's driver:
-  - `:latest` (CUDA 13) needs NVIDIA driver **≥ 580 (R580)**. Use the **CUDA Version ≥ 13.0** filter on RunPod / Vast.ai.
+  - `:latest` / `:cu130` (CUDA 13) needs NVIDIA driver **≥ 580 (R580)**. Use the **CUDA Version ≥ 13.0** filter on RunPod / Vast.ai.
   - `:cu128` (CUDA 12.8) needs NVIDIA driver **≥ 555 (R555)**. Use **CUDA Version ≥ 12.8**.
 
   The entrypoint's pre-flight check aborts in <1s with a clear message if you pick an incompatible pod — swap the template's `Container Image` to the other tag and redeploy.

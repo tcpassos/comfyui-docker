@@ -249,8 +249,8 @@ download_model() {
         fi
     fi
 
-    # HuggingFace URLs: try huggingface_hub + hf_transfer first. Falls through
-    # to aria2c/curl on any failure (network, parse, transfer crash).
+    # HuggingFace URLs: try huggingface_hub + hf-xet first (HF_XET_HIGH_PERFORMANCE=1).
+    # Falls through to aria2c/curl on any failure (network, parse, transfer crash).
     if [[ "$url" =~ ^https://huggingface\.co/(datasets/)?([^/]+/[^/]+)/resolve/([^/?#]+)/([^?#]+) ]]; then
         local hf_repo_prefix="${BASH_REMATCH[1]}"
         local hf_repo_id="${BASH_REMATCH[2]}"
@@ -258,23 +258,26 @@ download_model() {
         local hf_path_in_repo="${BASH_REMATCH[4]}"
         local hf_repo_type="model"
         [[ -n "$hf_repo_prefix" ]] && hf_repo_type="dataset"
-        log "Downloading $fname (hf_transfer)"
-        if _download_hf_transfer "$hf_repo_type" "$hf_repo_id" "$hf_revision" \
-                                 "$hf_path_in_repo" "$dest_dir" "$fname"; then
+        log "Downloading $fname (hf_xet)"
+        if _download_hf_xet "$hf_repo_type" "$hf_repo_id" "$hf_revision" \
+                            "$hf_path_in_repo" "$dest_dir" "$fname"; then
             return 0
         fi
-        warn "hf_transfer failed — retrying with aria2c"
+        warn "hf_xet failed — retrying with aria2c"
     else
         log "Downloading $fname"
     fi
 
     # aria2c uses up to 16 parallel connections to a single file — typically
     # 4-16x faster than curl on multi-GB models from HF / Civitai CDNs.
+    # --file-allocation=none skips the pre-allocation step (fallocate) that can
+    # stall for minutes on large files on network volumes (RunPod / Vast.ai).
     if command -v aria2c >/dev/null 2>&1; then
         local args=(
             --console-log-level=warn --summary-interval=10
             --max-tries=3 --retry-wait=5
             --max-connection-per-server=16 --split=16 --min-split-size=1M
+            --file-allocation=none
             --auto-file-renaming=false --allow-overwrite=true
             --continue=true
             --dir="$dest_dir" --out="$fname"
@@ -289,17 +292,18 @@ download_model() {
     _download_curl "$url" "$dest_dir" "$fname" "$auth_header"
 }
 
-# huggingface_hub.hf_hub_download with HF_HUB_ENABLE_HF_TRANSFER=1 uses the
-# hf_transfer Rust binary for ranged parallel downloads (~2-3x aria2c on HF's
-# CDN). The library always writes to {local_dir}/{path_in_repo} preserving
-# subdirs, so we download to a temp dir and move the leaf file to {dest}/{fname}
-# to keep the flat layout expected by ComfyUI's loaders.
-_download_hf_transfer() {
+# huggingface_hub.hf_hub_download with HF_XET_HIGH_PERFORMANCE=1 uses hf-xet
+# (bundled in huggingface_hub 1.x) for high-performance parallel downloads.
+# (HF_HUB_ENABLE_HF_TRANSFER / hf_transfer package are deprecated since 1.x.)
+# The library always writes to {local_dir}/{path_in_repo} preserving subdirs,
+# so we download to a temp dir and move the leaf file to {dest}/{fname} to keep
+# the flat layout expected by ComfyUI's loaders.
+_download_hf_xet() {
     local repo_type="$1" repo_id="$2" revision="$3" path_in_repo="$4"
     local dest_dir="$5" fname="$6"
     local tmp_dir
     tmp_dir=$(mktemp -d)
-    if ! HF_HUB_ENABLE_HF_TRANSFER=1 python3 - <<PY
+    if ! HF_XET_HIGH_PERFORMANCE=1 python3 - <<PY
 import os, sys
 from huggingface_hub import hf_hub_download
 try:
