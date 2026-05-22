@@ -49,14 +49,18 @@ RUN git clone --depth 1 --branch "${COMFYUI_VERSION}" \
         https://github.com/comfyanonymous/ComfyUI.git "${COMFYUI_HOME}"
 
 # Verify the base image actually provides the expected torch/CUDA stack.
+# Accepts CUDA 12.x or 13.x so the same Dockerfile builds both the
+# `:latest` (cu130) and `:cu128` tags via --build-arg BASE_IMAGE.
 ENV INSTALL_SAGE=${INSTALL_SAGE}
-RUN python3 -c "import torch, torchvision, torchaudio; print('torch', torch.__version__, 'cuda', torch.version.cuda); assert torch.version.cuda.startswith('13.'), torch.version.cuda"
+RUN python3 -c "import torch, torchvision, torchaudio; print('torch', torch.__version__, 'cuda', torch.version.cuda); assert torch.version.cuda.split('.')[0] in ('12','13'), torch.version.cuda"
 
 # ----- ComfyUI requirements + entrypoint helpers -----------------------------
-# huggingface_hub[hf_transfer] enables the Rust-based parallel downloader
-# (HF_HUB_ENABLE_HF_TRANSFER=1) used by the entrypoint for HuggingFace URLs.
+# hf_transfer is the Rust-based parallel downloader used by the entrypoint for
+# HuggingFace URLs when HF_HUB_ENABLE_HF_TRANSFER=1. In huggingface_hub 1.x
+# the `[hf_transfer]` extra was removed (hf-xet replaced it as the bundled
+# accelerator), so install hf_transfer as a standalone package alongside it.
 RUN uv pip install --system -r "${COMFYUI_HOME}/requirements.txt" \
-    && uv pip install --system gitpython toml "huggingface_hub[hf_transfer]" \
+    && uv pip install --system gitpython toml huggingface_hub hf_transfer \
     # kornia 0.8+ removed `pad` from geometry.transform.pyramid, which breaks
     # ComfyUI-LTXVideo's pyramid_blending module. Pin to a working version.
     && uv pip install --system "kornia==0.7.3"

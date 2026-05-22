@@ -3,7 +3,15 @@
 Pre-baked **ComfyUI** image for **RunPod** and **Vast.ai** with fast cold start.
 Custom nodes and models are declared in a `config.json` and downloaded on first boot — the workflow lives in the volume, not the image.
 
-- **Base**: `pytorch/pytorch:2.12.0-cuda13.0-cudnn9-runtime`
+## Available tags
+
+| Tag       | Base image                                            | torch          | CUDA  | Min NVIDIA driver | When to pick                                                                                  |
+|-----------|-------------------------------------------------------|----------------|-------|-------------------|-----------------------------------------------------------------------------------------------|
+| `latest`  | `pytorch/pytorch:2.12.0-cuda13.0-cudnn9-runtime`      | 2.12.0+cu130   | 13.0  | R580+             | Default. Blackwell (RTX 5090, B200) and any pod whose host advertises CUDA ≥ 13.              |
+| `cu128`   | `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime`      | 2.11.0+cu128   | 12.8  | R555+             | Older drivers (A40, A100, L40 on hosts stuck on R5xx). Pre-flight aborts `:latest` on these.  |
+
+Both tags ship the same entrypoint, nginx setup, custom-node provisioning and pre-flight GPU check. The only difference is the torch / CUDA stack baked into the base image. SageAttention 2.2.0 wheels for either combo are pulled at boot from [`tcpassos/sage-wheels-linux`](https://github.com/tcpassos/sage-wheels-linux).
+
 - **Image size**: ~7.2 GB
 - **ComfyUI**: latest (overridable via `--build-arg COMFYUI_VERSION=`)
 - **Boot stack**: [`uv`](https://github.com/astral-sh/uv) for pip, `hf_transfer` + `aria2c` for parallel downloads, shallow clones
@@ -35,7 +43,7 @@ Generate a `config.json` at **[comfyforge.app](https://comfyforge.app)** (import
 | Docker Options | `-p 8188:8188 -p 22:22 -e OPEN_BUTTON_PORT=8188` |
 | Disk Space | **25 GB** minimum (no container/volume split — attach a separate volume for models) |
 
-> Filter offers by **CUDA Version ≥ 13.0** — the image ships CUDA 13 (torch 2.12 + cu130). On RTX 3090/4090/5090 the host needs NVIDIA driver **≥ R580**, otherwise boot fails with `error 804: forward compatibility was attempted on non supported HW`.
+> Pick the tag that matches the host driver: `:latest` (CUDA 13) needs NVIDIA driver **≥ R580**, `:cu128` (CUDA 12.8) needs **≥ R555**. On RunPod / Vast.ai, filter offers by **CUDA Version ≥ 13.0** for `:latest` or **≥ 12.8** for `:cu128`. The image's pre-flight aborts in <1s with `error 804: forward compatibility was attempted on non supported HW` if the driver is too old — swap the tag and redeploy.
 
 ---
 

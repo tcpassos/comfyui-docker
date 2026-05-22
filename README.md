@@ -3,6 +3,17 @@
 Pre-baked Docker image to run ComfyUI on **RunPod** and **Vast.ai** with fast cold start.
 Everything heavy ships in the image; what changes per workflow lives in `/workspace/config.json`.
 
+## Available tags
+
+| Tag                                 | Base image                                            | torch          | CUDA  | Min NVIDIA driver | Paired Sage release                  | When to pick                                                                                  |
+|-------------------------------------|-------------------------------------------------------|----------------|-------|-------------------|--------------------------------------|-----------------------------------------------------------------------------------------------|
+| `tcpassos/comfyui-cloud:latest`     | `pytorch/pytorch:2.12.0-cuda13.0-cudnn9-runtime`      | 2.12.0+cu130   | 13.0  | R580+             | `sage-2.2.0-torch-2.12.0-cu130-py312` | Default. Blackwell (RTX 5090, B200) and any pod whose host advertises CUDA ≥ 13.              |
+| `tcpassos/comfyui-cloud:cu128`      | `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime`      | 2.11.0+cu128   | 12.8  | R555+             | `sage-2.2.0-torch-2.11.0-cu128-py312` | Older drivers (A40, A100, L40 on hosts stuck on R5xx). Pre-flight aborts `:latest` on these.  |
+
+Both tags ship the same entrypoint, nginx setup, custom-node provisioning and pre-flight GPU check. The only difference is the torch / CUDA stack baked into the base image. The entrypoint queries [`tcpassos/sage-wheels-linux`](https://github.com/tcpassos/sage-wheels-linux) at boot and pulls the wheel whose `torch-X-cuY-pyZ` tag matches the running container and whose SM matches the detected GPU.
+
+The Sage compatibility matrix lives at [tcpassos/sage-wheels-linux](https://github.com/tcpassos/sage-wheels-linux#supported-matrix).
+
 ## Layout
 
 | Item | Location | Persistent? |
@@ -16,9 +27,20 @@ Everything heavy ships in the image; what changes per workflow lives in `/worksp
 
 ## Build
 
+The Dockerfile defaults to the CUDA 13 base (image tag `:latest`):
+
 ```powershell
 docker build -t tcpassos/comfyui-cloud:latest C:\dev\comfyui-docker
 docker push tcpassos/comfyui-cloud:latest
+```
+
+Build the CUDA 12.8 variant from the **same Dockerfile** via `--build-arg BASE_IMAGE`:
+
+```powershell
+docker build `
+  --build-arg BASE_IMAGE=pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime `
+  -t tcpassos/comfyui-cloud:cu128 C:\dev\comfyui-docker
+docker push tcpassos/comfyui-cloud:cu128
 ```
 
 > Final size: ~7.2 GB (using the `pytorch/pytorch:*-runtime` base; the previous `-devel` base produced an image of ~16 GB). Build takes ~5–10 min on a good connection.
@@ -128,7 +150,11 @@ RunPod Console → **Templates** → **+ New Template**:
 
 Templates → your template → **Deploy**:
 
-- **GPU**: any GPU whose host driver supports CUDA 13.0 (NVIDIA driver ≥ 580). Use the **CUDA Version** filter in RunPod / Vast.ai to narrow the list — the entrypoint's pre-flight will abort early with a clear message if you pick an incompatible pod.
+- **GPU**: pick the tag that matches the host's driver:
+  - `:latest` (CUDA 13) needs NVIDIA driver **≥ 580 (R580)**. Use the **CUDA Version ≥ 13.0** filter on RunPod / Vast.ai.
+  - `:cu128` (CUDA 12.8) needs NVIDIA driver **≥ 555 (R555)**. Use **CUDA Version ≥ 12.8**.
+
+  The entrypoint's pre-flight check aborts in <1s with a clear message if you pick an incompatible pod — swap the template's `Container Image` to the other tag and redeploy.
 - **Volume**: ✅ enable to persist `/workspace` across stops.
 - **Region**: any; prefer the same region where you already have a volume if reusing it.
 
@@ -189,7 +215,9 @@ Vast.ai Console → **Templates** → **New Template**:
 
 ### 2. Rent an instance
 
-- Pick a GPU whose driver supports CUDA 12.x+ (this image ships CUDA 13). RTX 4090 / 5090 / Blackwell-class is ideal.
+- Pick a GPU + tag combo your host driver supports:
+  - `:latest` (CUDA 13) → driver R580+ (RTX 5090, B200, and most modern hosts that advertise CUDA ≥ 13).
+  - `:cu128` (CUDA 12.8) → driver R555+ (RTX 4090, A40, A100, L40 on hosts stuck on R5xx).
 - Use the template above.
 - Rent → wait for status to flip to "Running".
 
@@ -277,5 +305,5 @@ pkill -f "python3 main.py" ; cd /opt/ComfyUI && python3 main.py --listen 0.0.0.0
 - **Civitai returns HTML instead of a `.safetensors`**: invalid / expired token, or the model requires additional login (early access). Check `CIVITAI_TOKEN`.
 - **HF 401**: token without read permission on the gated repo. Accept the model's terms on HuggingFace first.
 - **`xformers` warning in logs**: expected (see Build section above). It does not affect generation if you use sageattention in your nodes.
-- **Out of memory / CUDA errors**: the base image is PyTorch 2.9 + CUDA 13, but this image overrides to torch 2.12 + cu130. The host driver must support CUDA 13 (RunPod handles that on Blackwell / Hopper pods).
+- **Out of memory / CUDA errors**: confirm the host driver matches the tag you picked — `:latest` needs R580+ (CUDA 13), `:cu128` needs R555+ (CUDA 12.8). The pre-flight check at boot prints the detected driver and aborts early on mismatches; if it didn't fire, the GPU itself may be saturated.
 - **Pod boots very fast without downloading anything**: the volume probably has an old `config.json` mounted. Edit `/workspace/config.json` via the Web Terminal and restart.
