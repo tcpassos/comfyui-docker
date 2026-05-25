@@ -2,7 +2,7 @@
 # =============================================================================
 #  Entrypoint for the comfyui-cloud image
 #  - Ensures the expected structure under /workspace
-#  - Reads /workspace/config.json (seeds from /opt/config.example.json if missing)
+#  - Reads /workspace/config.json (required; supply via CONFIG_URL or bake it in)
 #  - Syncs custom_nodes and models
 #  - Starts ComfyUI with --base-directory /workspace
 # =============================================================================
@@ -145,11 +145,22 @@ mkdir -p \
     "${WORKSPACE}/output" \
     "${WORKSPACE}/temp"
 
+# ----- Merge baked content (if present) --------------------------------------
+# Images built via ComfyForge / Dockerfile.bake ship pre-populated content at
+# /opt/preinstalled (custom_nodes, models, workflows). Copy what's missing into
+# /workspace before provisioning. User content always wins (no-clobber).
+# No-op for un-baked images (the script just exits 0 if /opt/preinstalled is absent).
+if [[ -x /usr/local/bin/comfy-merge-preinstalled ]]; then
+    /usr/local/bin/comfy-merge-preinstalled || warn "Preinstalled merge reported issues — continuing"
+fi
+
 # Provision config.json if it does not exist on the volume yet.
-# Priority: CONFIG_URL (env) > /opt/config.example.json (bundled default).
-# The example is a minimal config (just ComfyUI-Manager + ComfyUI-Lora-Manager,
-# no models) — enough to land a working UI on first boot without forcing the
-# user to provide a config upfront.
+# This image requires a config — supply one in exactly one of these ways:
+#   1. CONFIG_URL (env)              — explicit user override, always wins
+#   2. /opt/baked-config.json        — bundled by Dockerfile.bake (baked image)
+#   3. /workspace/config.json        — already present in the mounted volume
+# No silent fallback: if none of the above are available, the pod aborts so
+# the user gets an immediate, actionable error instead of a half-working UI.
 if [[ ! -f "$CONFIG" ]]; then
     if [[ -n "${CONFIG_URL:-}" ]]; then
         log "Downloading config from \$CONFIG_URL → $CONFIG"
@@ -157,261 +168,26 @@ if [[ ! -f "$CONFIG" ]]; then
             err "Failed to download CONFIG_URL: $CONFIG_URL"
             exit 1
         fi
-    elif [[ -f /opt/config.example.json ]]; then
-        log "No CONFIG_URL set and $CONFIG missing — seeding from bundled /opt/config.example.json"
-        log "Edit $CONFIG and restart the pod to add your own nodes/models."
-        cp /opt/config.example.json "$CONFIG"
+    elif [[ -f /opt/baked-config.json ]]; then
+        log "Seeding $CONFIG from baked config at /opt/baked-config.json"
+        cp /opt/baked-config.json "$CONFIG"
     else
-        err "Missing $CONFIG, CONFIG_URL not set, and no bundled example found."
-        err "Set the CONFIG_URL env var or create $CONFIG manually and restart."
+        err "No config.json available. Set CONFIG_URL, mount a config.json into"
+        err "${CONFIG}, or use an image built with ComfyForge / Dockerfile.bake."
         exit 1
     fi
 fi
 
-# ----- Helpers ---------------------------------------------------------------
-HF_TOKEN="${HF_TOKEN:-}"
-CIVITAI_TOKEN="${CIVITAI_TOKEN:-}"
-UPDATE_NODES="${UPDATE_NODES:-false}"  # if true, git-pull existing nodes
-
-# Prefer uv (Astral) for pip operations — ~10-30x faster than pip and
-# resolves all requirements in a single pass. Falls back to pip if uv isn't
-# installed (e.g. when entrypoint is run outside this image).
-if command -v uv >/dev/null 2>&1; then
-    PIP_INSTALL=(uv pip install --system)
-else
-    PIP_INSTALL=(pip install --upgrade-strategy only-if-needed)
-fi
-
-clone_node() {
-    local url="$1" ref="${2:-}" path dir
-    dir="${url##*/}"; dir="${dir%.git}"
-    path="${WORKSPACE}/custom_nodes/${dir}"
-    if [[ -d "$path/.git" ]]; then
-        if [[ "$UPDATE_NODES" == "true" && -z "$ref" ]]; then
-            log "Updating node: $dir"
-            git -C "$path" pull --ff-only 2>/dev/null || warn "git pull failed for $dir"
-        else
-            ok "Node already present: $dir (skip)"
-        fi
-    else
-        log "Cloning node: $dir${ref:+ @ $ref}"
-        git clone --recursive "$url" "$path" || { warn "Clone failed: $url"; return; }
-        if [[ -n "$ref" ]]; then
-            git -C "$path" checkout "$ref" 2>/dev/null \
-                || warn "checkout '$ref' failed for $dir (kept HEAD)"
-        fi
-    fi
-    # NOTE: requirements.txt is NOT installed here. After all nodes are
-    # processed, the main loop runs a single consolidated install — the
-    # resolver runs once across every node's requirements instead of N times.
-}
-
-_download_curl() {
-    local url="$1" dest_dir="$2" fname="$3" auth_header="$4"
-    local args=(--fail --location --progress-bar --retry 3 --retry-delay 5 --continue-at -)
-    [[ -n "$auth_header" ]] && args+=(-H "$auth_header")
-    if ! curl "${args[@]}" -o "$dest_dir/$fname" "$url"; then
-        local rc=$?
-        warn "Failed: $url (curl exit ${rc})"
-        [[ -f "$dest_dir/$fname" && ! -s "$dest_dir/$fname" ]] && rm -f "$dest_dir/$fname"
-        if [[ $rc -eq 23 ]]; then
-            err "curl 23 = write failure. Disk full?"
-            df -h "$dest_dir" || true
-        fi
-        return $rc
-    fi
-}
-
-download_model() {
-    local url="$1" dest_dir="$2" fname="$3"
-    mkdir -p "$dest_dir"
-
-    if [[ "$url" =~ ^https://([a-zA-Z0-9_-]+\.)?huggingface\.co.*/blob/ ]]; then
-        url="${url/\/blob\//\/resolve\/}"
-    fi
-
-    if [[ -z "$fname" || "$fname" == "null" ]]; then
-        fname="${url##*/}"; fname="${fname%%\?*}"
-    fi
-
-    if [[ -s "$dest_dir/$fname" ]]; then
-        ok "Already present: $fname (skip)"
-        return 0
-    fi
-
-    local auth_header=""
-    if [[ "$url" =~ ^https://([a-zA-Z0-9_-]+\.)?huggingface\.co ]]; then
-        [[ -n "$HF_TOKEN" ]] && auth_header="Authorization: Bearer $HF_TOKEN"
-    elif [[ "$url" =~ ^https://([a-zA-Z0-9_-]+\.)?civitai\.com ]]; then
-        if [[ -n "$CIVITAI_TOKEN" ]]; then
-            if [[ "$url" == *"?"* ]]; then url="${url}&token=$CIVITAI_TOKEN"
-            else                            url="${url}?token=$CIVITAI_TOKEN"; fi
-        fi
-    fi
-
-    # HuggingFace URLs: try huggingface_hub + hf-xet first (HF_XET_HIGH_PERFORMANCE=1).
-    # Falls through to aria2c/curl on any failure (network, parse, transfer crash).
-    if [[ "$url" =~ ^https://huggingface\.co/(datasets/)?([^/]+/[^/]+)/resolve/([^/?#]+)/([^?#]+) ]]; then
-        local hf_repo_prefix="${BASH_REMATCH[1]}"
-        local hf_repo_id="${BASH_REMATCH[2]}"
-        local hf_revision="${BASH_REMATCH[3]}"
-        local hf_path_in_repo="${BASH_REMATCH[4]}"
-        local hf_repo_type="model"
-        [[ -n "$hf_repo_prefix" ]] && hf_repo_type="dataset"
-        log "Downloading $fname (hf_xet)"
-        if _download_hf_xet "$hf_repo_type" "$hf_repo_id" "$hf_revision" \
-                            "$hf_path_in_repo" "$dest_dir" "$fname"; then
-            return 0
-        fi
-        warn "hf_xet failed — retrying with aria2c"
-    else
-        log "Downloading $fname"
-    fi
-
-    # aria2c uses up to 16 parallel connections to a single file — typically
-    # 4-16x faster than curl on multi-GB models from HF / Civitai CDNs.
-    # --file-allocation=none skips the pre-allocation step (fallocate) that can
-    # stall for minutes on large files on network volumes (RunPod / Vast.ai).
-    if command -v aria2c >/dev/null 2>&1; then
-        local args=(
-            --console-log-level=warn --summary-interval=10
-            --max-tries=3 --retry-wait=5
-            --max-connection-per-server=16 --split=16 --min-split-size=1M
-            --file-allocation=none
-            --auto-file-renaming=false --allow-overwrite=true
-            --continue=true
-            --dir="$dest_dir" --out="$fname"
-        )
-        [[ -n "$auth_header" ]] && args+=(--header="$auth_header")
-        if aria2c "${args[@]}" "$url"; then
-            return 0
-        fi
-        warn "aria2 failed — retrying with curl"
-        [[ -f "$dest_dir/$fname" && ! -s "$dest_dir/$fname" ]] && rm -f "$dest_dir/$fname"
-    fi
-    _download_curl "$url" "$dest_dir" "$fname" "$auth_header"
-}
-
-# huggingface_hub.hf_hub_download with HF_XET_HIGH_PERFORMANCE=1 uses hf-xet
-# (bundled in huggingface_hub 1.x) for high-performance parallel downloads.
-# (HF_HUB_ENABLE_HF_TRANSFER / hf_transfer package are deprecated since 1.x.)
-# The library always writes to {local_dir}/{path_in_repo} preserving subdirs,
-# so we download to a temp dir and move the leaf file to {dest}/{fname} to keep
-# the flat layout expected by ComfyUI's loaders.
-_download_hf_xet() {
-    local repo_type="$1" repo_id="$2" revision="$3" path_in_repo="$4"
-    local dest_dir="$5" fname="$6"
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    if ! HF_XET_HIGH_PERFORMANCE=1 python3 - <<PY
-import os, sys
-from huggingface_hub import hf_hub_download
-try:
-    hf_hub_download(
-        repo_id="$repo_id",
-        filename="$path_in_repo",
-        revision="$revision",
-        repo_type="$repo_type",
-        local_dir="$tmp_dir",
-        token=os.environ.get("HF_TOKEN") or None,
-    )
-except Exception as e:
-    print(f"hf_hub_download error: {e}", file=sys.stderr)
-    sys.exit(1)
-PY
-    then
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    local downloaded="$tmp_dir/$path_in_repo"
-    if [[ ! -s "$downloaded" ]]; then
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    mv "$downloaded" "$dest_dir/$fname"
-    rm -rf "$tmp_dir"
-    return 0
-}
-
-# ----- Process config.json ---------------------------------------------------
-if [[ ! -f "$CONFIG" ]]; then
-    err "Missing config.json — aborting"
-    exit 1
-fi
-
-if ! jq empty "$CONFIG" 2>/dev/null; then
-    err "config.json at $CONFIG is invalid JSON. Fix it and restart."
-    jq . "$CONFIG" || true   # prints the jq error
-    exit 1
-fi
-
-log "Reading $CONFIG"
-
-# Custom nodes — accepts a string "url" OR an object {url, ref}
-NUM_NODES=$(jq -r '.nodes | length // 0' "$CONFIG")
-log "Configuring ${NUM_NODES} custom node(s)..."
-for ((i=0; i<NUM_NODES; i++)); do
-    type=$(jq -r ".nodes[$i] | type" "$CONFIG")
-    if [[ "$type" == "string" ]]; then
-        url=$(jq -r ".nodes[$i]" "$CONFIG")
-        clone_node "$url"
-    else
-        url=$(jq -r ".nodes[$i].url"       "$CONFIG")
-        ref=$(jq -r ".nodes[$i].ref // empty" "$CONFIG")
-        clone_node "$url" "$ref"
-    fi
-done
-
-# Consolidated dependency install — passing all requirements.txt files to a
-# single resolver invocation is dramatically faster than installing per-node,
-# since pip/uv resolves shared dependencies (torch, numpy, transformers, ...)
-# only once instead of N times.
-REQ_ARGS=()
-REQ_COUNT=0
-for req in "${WORKSPACE}/custom_nodes/"*/requirements.txt; do
-    [[ -f "$req" ]] || continue
-    REQ_ARGS+=(-r "$req")
-    REQ_COUNT=$((REQ_COUNT + 1))
-done
-if (( REQ_COUNT > 0 )); then
-    log "Installing custom-node dependencies (${REQ_COUNT} requirements files, single pass via ${PIP_INSTALL[0]})"
-    "${PIP_INSTALL[@]}" "${REQ_ARGS[@]}" \
-        || warn "Some custom-node dependencies failed to install (see log above)"
-fi
-
-# Models (array of objects {category|path, url, filename?})
-# - `path` (optional): destination override, relative to $WORKSPACE (or absolute).
-# - `category` (fallback): destination = models/<category>/.
-NUM_MODELS=$(jq -r '.models | length // 0' "$CONFIG")
-log "Configuring ${NUM_MODELS} model(s)..."
-for ((i=0; i<NUM_MODELS; i++)); do
-    cat=$(jq -r ".models[$i].category // empty" "$CONFIG")
-    p=$(jq  -r ".models[$i].path     // empty" "$CONFIG")
-    url=$(jq -r ".models[$i].url"               "$CONFIG")
-    fn=$(jq  -r ".models[$i].filename // empty" "$CONFIG")
-
-    if [[ -n "$p" ]]; then
-        if [[ "$p" == /* ]]; then dest="$p"; else dest="${WORKSPACE}/${p}"; fi
-    elif [[ -n "$cat" ]]; then
-        dest="${WORKSPACE}/models/${cat}"
-    else
-        warn "models[$i] has neither 'path' nor 'category' — skipping"; continue
-    fi
-    download_model "$url" "$dest" "$fn"
-done
-
-# Workflows (array of objects {url, filename?}) → /workspace/user/default/workflows/
-NUM_WF=$(jq -r '.workflows | length // 0' "$CONFIG")
-if (( NUM_WF > 0 )); then
-    log "Configuring ${NUM_WF} workflow(s)..."
-    WF_DIR="${WORKSPACE}/user/default/workflows"
-    mkdir -p "$WF_DIR"
-    for ((i=0; i<NUM_WF; i++)); do
-        url=$(jq -r ".workflows[$i].url"               "$CONFIG")
-        fn=$(jq  -r ".workflows[$i].filename // empty" "$CONFIG")
-        download_model "$url" "$WF_DIR" "$fn"
-    done
-fi
+# ----- Provision custom_nodes, models, workflows from config.json -----------
+# All provisioning logic lives in /usr/local/bin/comfy-provision (a reusable
+# script also invoked at build time by ComfyForge-generated Dockerfile.bake to
+# pre-populate /opt/preinstalled). Idempotent — skips items already on disk
+# (including those just merged from /opt/preinstalled).
+CONFIG="$CONFIG" PROVISION_TARGET="$WORKSPACE" \
+HF_TOKEN="${HF_TOKEN:-}" CIVITAI_TOKEN="${CIVITAI_TOKEN:-}" \
+UPDATE_NODES="${UPDATE_NODES:-false}" \
+    /usr/local/bin/comfy-provision \
+    || { err "Provisioning failed — aborting"; exit 1; }
 
 # ----- Sage Attention build (runtime, GPU-arch specific) ---------------------
 # Sage 2.x must match the target GPU's compute capability

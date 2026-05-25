@@ -64,11 +64,18 @@ RUN uv pip install --system -r "${COMFYUI_HOME}/requirements.txt" \
     # ComfyUI-LTXVideo's pyramid_blending module. Pin to a working version.
     && uv pip install --system "kornia==0.7.3"
 
-# ----- Entrypoint + example config + nginx -----------------------------------
+# ----- Entrypoint + provisioning scripts + nginx -----------------------------
+# provision.sh and merge-preinstalled.sh are reusable helpers:
+#   - entrypoint calls them at runtime
+#   - ComfyForge-generated Dockerfile.bake calls comfy-provision at build time
+#     with PROVISION_TARGET=/opt/preinstalled to pre-populate the image.
 COPY entrypoint.sh /usr/local/bin/comfy-entrypoint
-COPY config.example.json /opt/config.example.json
+COPY provision.sh /usr/local/bin/comfy-provision
+COPY merge-preinstalled.sh /usr/local/bin/comfy-merge-preinstalled
 COPY nginx.conf /etc/nginx/conf.d/comfyui.conf
 RUN chmod +x /usr/local/bin/comfy-entrypoint \
+              /usr/local/bin/comfy-provision \
+              /usr/local/bin/comfy-merge-preinstalled \
     && rm -f /etc/nginx/sites-enabled/default \
     && rm -f /etc/nginx/conf.d/default.conf \
     # RunPod base image's nginx.conf does NOT include conf.d/*.conf — inject it

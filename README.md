@@ -140,7 +140,7 @@ RunPod Console → **Templates** → **+ New Template**:
 |---|---|
 | `HF_TOKEN` | your HuggingFace token (read) |
 | `CIVITAI_TOKEN` | your Civitai token |
-| `CONFIG_URL` | **optional**. Public URL (Gist / raw GitHub) of a `config.json`. If unset *and* `/workspace/config.json` does not yet exist in the volume, the entrypoint seeds `/workspace/config.json` from the bundled `/opt/config.example.json` (a minimal two-node setup with ComfyUI-Manager and ComfyUI-Lora-Manager). |
+| `CONFIG_URL` | **required** unless `/workspace/config.json` already exists in the volume or the image was built with ComfyForge (which bakes `/opt/baked-config.json`). Public URL (Gist / raw GitHub) of a `config.json`. The entrypoint aborts with a clear error if no config can be found. |
 | `UPDATE_NODES` | `false` (default) — does not update existing custom nodes on boot, keeping deploys reproducible. `true` runs `git pull --ff-only` on every node without a pinned `ref`. |
 | `PORT` | `8188` (optional, default is 8188) |
 | `INSTALL_SAGE` | `true` (default) — install SageAttention 2.x at boot if not already present. Set to `false` to skip entirely. |
@@ -166,14 +166,14 @@ Deploy → wait for "Running".
 ### 3. First boot
 
 **Takes 5–15 min** because the entrypoint will:
-1. Resolve `config.json`: download from `CONFIG_URL` if set, else fall back to the bundled `/opt/config.example.json` (minimal two-node example).
+1. Resolve `config.json`: download from `CONFIG_URL`, or use `/opt/baked-config.json` if the image was built with ComfyForge, or use an existing `/workspace/config.json` from the volume. If none is available, the pod aborts.
 2. Clone the custom nodes listed in `nodes[]`.
 3. `pip install` the requirements of each node.
 4. Download the models listed in `models[]` (HF / Civitai using the tokens from the env vars).
 
 Follow along in **Connect → Logs**. When you see `Starting ComfyUI on port 8188`, you're ready.
 
-> Without `CONFIG_URL` set and without a pre-populated volume: the entrypoint seeds `/workspace/config.json` from `/opt/config.example.json` (ComfyUI-Manager + ComfyUI-Lora-Manager, no models). Edit the file on the volume and restart the pod to customize.
+> Tip: for fast cold starts, use **ComfyForge** to build a pre-baked image where the nodes and models are already inside the image layers — first boot drops from minutes to seconds.
 
 ### 4. Connect
 
