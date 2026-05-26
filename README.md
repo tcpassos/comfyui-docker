@@ -3,15 +3,18 @@
 Pre-baked Docker image to run ComfyUI on **RunPod** and **Vast.ai** with fast cold start.
 Everything heavy ships in the image; what changes per workflow lives in `/workspace/config.json`.
 
+> Need a `config.json` quickly? Use [**ComfyForge**](https://comfyforge.app) (web app + CLI: `npx comfyforge`) to drop a workflow and get a ready-to-deploy config, or bake your nodes + models into a custom image on top of this one. Source: [github.com/tcpassos/comfyforge](https://github.com/tcpassos/comfyforge).
+
 ## Available tags
 
 | Tag                                 | Base image                                            | torch          | CUDA  | Min NVIDIA driver | Paired Sage release                  | When to pick                                                                                  |
 |-------------------------------------|-------------------------------------------------------|----------------|-------|-------------------|--------------------------------------|-----------------------------------------------------------------------------------------------|
-| `tcpassos/comfyui-cloud:latest`     | `pytorch/pytorch:2.12.0-cuda13.0-cudnn9-runtime`      | 2.12.0+cu130   | 13.0  | R580+             | `sage-2.2.0-torch-2.12.0-cu130-py312` | Default. Blackwell (RTX 5090, B200) and any pod whose host advertises CUDA ≥ 13.              |
-| `tcpassos/comfyui-cloud:cu130`      | *(alias for `latest`, same image ID)*                 | 2.12.0+cu130   | 13.0  | R580+             | `sage-2.2.0-torch-2.12.0-cu130-py312` | Explicit pin when you want CUDA 13 but don't want to follow a moving `latest`.                |
+| `tcpassos/comfyui-cloud:latest`     | `pytorch/pytorch:2.12.0-cuda13.0-cudnn9-runtime`      | 2.12.0+cu130   | 13.0  | R580+             | `sage-2.2.0-torch-2.12.0-cu130-py312` | Default for **deploy** (runtime provisioning via `CONFIG_URL`). Blackwell (RTX 5090, B200) and any pod whose host advertises CUDA ≥ 13. |
+| `tcpassos/comfyui-cloud:bake-v1`    | *(same image ID as `latest` today; pinned bake contract)* | 2.12.0+cu130 | 13.0  | R580+             | `sage-2.2.0-torch-2.12.0-cu130-py312` | Stable `FROM` base for **bake** (ComfyForge `--base`). Pin `v1` so a future `bake-v2` breaking change won't rebuild your bake'd image differently. |
+| `tcpassos/comfyui-cloud:cu130`      | `pytorch/pytorch:2.12.0-cuda13.0-cudnn9-runtime`      | 2.12.0+cu130   | 13.0  | R580+             | `sage-2.2.0-torch-2.12.0-cu130-py312` | Explicit CUDA 13 pin. Re-tagged from `:latest` at each release, but not guaranteed to track every `:latest` push. |
 | `tcpassos/comfyui-cloud:cu128`      | `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime`      | 2.11.0+cu128   | 12.8  | R555+             | `sage-2.2.0-torch-2.11.0-cu128-py312` | Older drivers (A40, A100, L40 on hosts stuck on R5xx). Pre-flight aborts `:latest` on these.  |
 
-Both tags ship the same entrypoint, nginx setup, custom-node provisioning and pre-flight GPU check. The only difference is the torch / CUDA stack baked into the base image. The entrypoint queries [`tcpassos/sage-wheels-linux`](https://github.com/tcpassos/sage-wheels-linux) at boot and pulls the wheel whose `torch-X-cuY-pyZ` tag matches the running container and whose SM matches the detected GPU.
+All tags ship the same entrypoint, nginx setup, custom-node provisioning and pre-flight GPU check. The only difference is the torch / CUDA stack baked into the base image (and `bake-v1` is just an alias that pins the bake contract version). The entrypoint queries [`tcpassos/sage-wheels-linux`](https://github.com/tcpassos/sage-wheels-linux) at boot and pulls the wheel whose `torch-X-cuY-pyZ` tag matches the running container and whose SM matches the detected GPU.
 
 The Sage compatibility matrix lives at [tcpassos/sage-wheels-linux](https://github.com/tcpassos/sage-wheels-linux#supported-matrix).
 
@@ -33,9 +36,13 @@ The Dockerfile defaults to the CUDA 13 base (image tag `:latest`):
 ```powershell
 docker build -t tcpassos/comfyui-cloud:latest C:\dev\comfyui-docker
 docker tag tcpassos/comfyui-cloud:latest tcpassos/comfyui-cloud:cu130
+docker tag tcpassos/comfyui-cloud:latest tcpassos/comfyui-cloud:bake-v1
 docker push tcpassos/comfyui-cloud:latest
 docker push tcpassos/comfyui-cloud:cu130
+docker push tcpassos/comfyui-cloud:bake-v1
 ```
+
+> Only bump `:bake-v1` → `:bake-v2` when the **bake interface changes** (e.g., directory layout, env contract, base assumptions). Routine entrypoint / nginx / Sage updates should keep `:bake-v1` moving in sync with `:latest`.
 
 Build the CUDA 12.8 variant from the **same Dockerfile** via `--build-arg BASE_IMAGE`:
 
@@ -140,7 +147,7 @@ RunPod Console → **Templates** → **+ New Template**:
 |---|---|
 | `HF_TOKEN` | your HuggingFace token (read) |
 | `CIVITAI_TOKEN` | your Civitai token |
-| `CONFIG_URL` | **required** unless `/workspace/config.json` already exists in the volume or the image was built with ComfyForge (which bakes `/opt/baked-config.json`). Public URL (Gist / raw GitHub) of a `config.json`. The entrypoint aborts with a clear error if no config can be found. |
+| `CONFIG_URL` | **required** unless `/workspace/config.json` already exists in the volume or the image was built with [ComfyForge](https://comfyforge.app) (which bakes `/opt/baked-config.json`). Public URL (Gist / raw GitHub) of a `config.json`. The entrypoint aborts with a clear error if no config can be found. |
 | `UPDATE_NODES` | `false` (default) — does not update existing custom nodes on boot, keeping deploys reproducible. `true` runs `git pull --ff-only` on every node without a pinned `ref`. |
 | `PORT` | `8188` (optional, default is 8188) |
 | `INSTALL_SAGE` | `true` (default) — install SageAttention 2.x at boot if not already present. Set to `false` to skip entirely. |
@@ -166,14 +173,14 @@ Deploy → wait for "Running".
 ### 3. First boot
 
 **Takes 5–15 min** because the entrypoint will:
-1. Resolve `config.json`: download from `CONFIG_URL`, or use `/opt/baked-config.json` if the image was built with ComfyForge, or use an existing `/workspace/config.json` from the volume. If none is available, the pod aborts.
+1. Resolve `config.json`: download from `CONFIG_URL`, or use `/opt/baked-config.json` if the image was built with [ComfyForge](https://comfyforge.app), or use an existing `/workspace/config.json` from the volume. If none is available, the pod aborts.
 2. Clone the custom nodes listed in `nodes[]`.
 3. `pip install` the requirements of each node.
 4. Download the models listed in `models[]` (HF / Civitai using the tokens from the env vars).
 
 Follow along in **Connect → Logs**. When you see `Starting ComfyUI on port 8188`, you're ready.
 
-> Tip: for fast cold starts, use **ComfyForge** to build a pre-baked image where the nodes and models are already inside the image layers — first boot drops from minutes to seconds.
+> Tip: for fast cold starts, use [**ComfyForge**](https://comfyforge.app) to build a pre-baked image where the nodes and models are already inside the image layers — first boot drops from minutes to seconds. CLI: `npx comfyforge bake <config-url>`.
 
 ### 4. Connect
 

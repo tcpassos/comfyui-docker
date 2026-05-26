@@ -157,18 +157,36 @@ fi
 # Provision config.json if it does not exist on the volume yet.
 # This image requires a config — supply one in exactly one of these ways:
 #   1. CONFIG_URL (env)              — explicit user override, always wins
+#                                      (re-downloaded on every boot; volume
+#                                       copy is overwritten only when contents
+#                                       differ, so pure-local edits to
+#                                       /workspace/config.json are lost if
+#                                       CONFIG_URL stays set — unset it to pin)
 #   2. /opt/baked-config.json        — bundled by Dockerfile.bake (baked image)
 #   3. /workspace/config.json        — already present in the mounted volume
 # No silent fallback: if none of the above are available, the pod aborts so
 # the user gets an immediate, actionable error instead of a half-working UI.
-if [[ ! -f "$CONFIG" ]]; then
-    if [[ -n "${CONFIG_URL:-}" ]]; then
-        log "Downloading config from \$CONFIG_URL → $CONFIG"
-        if ! curl --fail --location --retry 3 --retry-delay 5 -o "$CONFIG" "$CONFIG_URL"; then
-            err "Failed to download CONFIG_URL: $CONFIG_URL"
+if [[ -n "${CONFIG_URL:-}" ]]; then
+    TMP_CONFIG="$(mktemp)"
+    log "Fetching config from \$CONFIG_URL"
+    if ! curl --fail --location --retry 3 --retry-delay 5 -o "$TMP_CONFIG" "$CONFIG_URL"; then
+        err "Failed to download CONFIG_URL: $CONFIG_URL"
+        rm -f "$TMP_CONFIG"
+        if [[ ! -f "$CONFIG" ]]; then
             exit 1
         fi
-    elif [[ -f /opt/baked-config.json ]]; then
+        warn "Keeping existing $CONFIG from previous boot"
+    else
+        if [[ -f "$CONFIG" ]] && cmp -s "$TMP_CONFIG" "$CONFIG"; then
+            log "Config unchanged since last boot"
+            rm -f "$TMP_CONFIG"
+        else
+            mv "$TMP_CONFIG" "$CONFIG"
+            log "Wrote $CONFIG from \$CONFIG_URL"
+        fi
+    fi
+elif [[ ! -f "$CONFIG" ]]; then
+    if [[ -f /opt/baked-config.json ]]; then
         log "Seeding $CONFIG from baked config at /opt/baked-config.json"
         cp /opt/baked-config.json "$CONFIG"
     else

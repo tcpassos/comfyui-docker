@@ -37,6 +37,12 @@ if ! jq empty "$CONFIG" 2>/dev/null; then
     exit 1
 fi
 
+# schemaVersion check — absent = legacy v1 (silent), unknown future = warn but proceed.
+CFG_SCHEMA=$(jq -r '.schemaVersion // 1' "$CONFIG" 2>/dev/null || echo 1)
+if [[ "$CFG_SCHEMA" != "1" ]]; then
+    warn "config schemaVersion=$CFG_SCHEMA is newer than this provision script (supported: 1). Trying anyway."
+fi
+
 mkdir -p "${TARGET}/custom_nodes" "${TARGET}/models" "${TARGET}/user/default/workflows"
 
 # Prefer uv (Astral) for pip operations — ~10-30x faster than pip and
